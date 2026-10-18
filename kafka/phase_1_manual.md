@@ -267,19 +267,7 @@ telemetry-processors telemetry       2          15              15              
 > [!NOTE]
 > To reset offsets, all consumers in the target consumer group must be **stopped (inactive)**.
 
-#### Scenario 1: Dry Run Reset to Earliest
-Simulate rewinding the offset to the beginning without applying changes:
-```bash
-docker exec -it kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server kafka-1:29092 \
-  --group telemetry-processors \
-  --topic telemetry \
-  --reset-offsets \
-  --to-earliest \
-  --dry-run
-```
-
-#### Scenario 2: Execute Offset Reset to Earliest
+#### Scenario 1: Execute Offset Reset to Earliest
 ```bash
 docker exec -it kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server kafka-1:29092 \
@@ -288,6 +276,17 @@ docker exec -it kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
   --reset-offsets \
   --to-earliest \
   --execute
+```
+
+```bash
+docker exec -it kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka-1:29092 \
+  --topic telemetry \
+  --group telemetry-processors \
+  --property print.partition=true \
+  --property print.key=true \
+  --property print.value=true \
+  --property key.separator=" | "
 ```
 
 Now start a consumer in `telemetry-processors` again; you will see it reprocess every message from offset 0!
@@ -553,12 +552,233 @@ docker exec -it kafka-1 /opt/kafka/bin/kafka-configs.sh \
 
 ## 5. Phase 1 Mastery & Exit Criteria Checklist
 
-Before moving to Go client development (Phase 2), verify you can comfortably explain and execute:
+Before moving to Go client development, verify that you can explain and execute each concept clearly.
 
-- [ ] **Partition Mechanics**: Explain why partition count limits maximum consumer concurrency.
-- [ ] **Key Hashing**: Demonstrate how `murmur2(key)` ensures per-key ordering and predictable partition routing.
-- [ ] **Consumer Groups & Rebalances**: Explain group coordinators, heartbeats, and rebalance behavior when consumers join or exit.
-- [ ] **Offset Management**: Inspect lag with `kafka-consumer-groups.sh --describe` and rewind/reset offsets to reprocess streams.
-- [ ] **High Availability & Fault Tolerance**: Explain `replication-factor`, Partition Leader vs Follower roles, and `ISR`.
-- [ ] **Durability Guarantees**: Explain `min.insync.replicas` and producer `acks=all` under broker failure.
-- [ ] **Log Retention & Segments**: Contrast `cleanup.policy=delete` vs `cleanup.policy=compact` and explain why active segments are never purged immediately.
+Use the checklist in Q&A form below. If you can answer each question out loud without looking at the notes, you are ready for Phase 2.
+
+- [ ] Q: Why does partition count limit maximum consumer concurrency in a single consumer group?
+  - A: A partition can be assigned to only one consumer in a given group at a time. So if a topic has 3 partitions, a consumer group can have at most 3 active consumers processing those partitions in parallel.
+
+- [ ] Q: How does Kafka route messages when a key is provided?
+  - A: Kafka hashes the key and applies modulo with the number of partitions. The same key always maps to the same partition as long as the partition count stays the same, which keeps per-key ordering intact.
+
+- [ ] Q: What happens in a consumer group when a consumer joins or leaves?
+  - A: The group coordinator triggers a rebalance. Kafka reassigns partitions among the remaining active consumers so each partition is still consumed by exactly one member of that group.
+
+- [ ] Q: How do you inspect lag and rewind offsets?
+  - A: Use `kafka-consumer-groups.sh --describe` to view current offsets and lag, and `--reset-offsets --to-earliest` or `--shift-by` to reprocess data from a previous point.
+
+- [ ] Q: What is the difference between leader, follower, and ISR?
+  - A: The leader handles all reads/writes for a partition. Followers replicate from the leader. ISR is the subset of followers that are caught up enough to safely replace the leader if needed.
+
+- [ ] Q: How do replication factor, `min.insync.replicas`, and `acks=all` work together?
+  - A: Replication factor decides how many copies exist, ISR decides which copies are considered safe, and `acks=all` tells the producer to wait for acknowledgment from the leader and the required in-sync replicas before returning success.
+
+- [ ] Q: Why are `cleanup.policy=delete` and `cleanup.policy=compact` different?
+  - A: Delete removes old segments after retention rules; compact keeps only the newest value for each key and purges stale duplicates. The active segment is never cleaned while it is still receiving writes.
+
+---
+
+## Difference b/w replicationFactor, in-sync replica (ISR) & ackAll
+
+These three terms are related, but they are not the same thing. Think of them as three layers of durability:
+
+1. Replication Factor = storage goal
+2. ISR = healthy replica set
+3. `acks=all` = producer durability requirement
+
+### 1) Replication Factor
+
+- `replication.factor` is the number of copies Kafka keeps for each partition.
+- Example: `replication.factor=3` means Kafka stores 3 copies of the partition across the cluster.
+- For a single partition, that is typically:
+  - 1 leader
+  - 2 followers
+
+So if you have 100 brokers and create a topic with 3 partitions and replication factor 3, Kafka will not store the same partition on all 100 brokers. Instead, each partition has a leader and followers distributed across a small subset of brokers. Only the brokers holding those replicas participate for that topic.
+
+Example:
+
+- Partition 0 -> Leader on Broker 14, followers on Broker 27 and Broker 88
+- Partition 1 -> Leader on Broker 52, followers on Broker 11 and Broker 66
+- Partition 2 -> Leader on Broker 89, followers on Broker 19 and Broker 40
+
+The other 97 brokers may be handling other topics or other partitions, but they are not replicas for this topic unless assigned by metadata.
+
+### 2) In-Sync Replica (ISR)
+
+- ISR means the subset of replicas that are caught up with the leader.
+- Kafka only considers those replicas valid for safe failover and safe acknowledgments.
+- If a follower is lagging too far behind, it is removed from the ISR set.
+
+Example with `replication.factor=3`:
+
+- Leader = Broker A
+- Follower 1 = Broker B (caught up)
+- Follower 2 = Broker C (caught up)
+- ISR = {Broker A, Broker B, Broker C}
+
+If Broker C goes down or falls behind:
+
+- ISR may shrink to {Broker A, Broker B}
+
+A broker that is not in ISR is not considered safe enough to become the new leader or to satisfy durability guarantees.
+
+### 3) `acks=all`
+
+- `acks=all` is a producer setting, not a broker setting.
+- It tells Kafka: "Do not return success until the leader and the required in-sync replicas have written the record safely."
+- This is the producer-side durability guarantee.
+
+With:
+
+- `replication.factor=3`
+- `min.insync.replicas=2`
+- `acks=all`
+
+Kafka will only acknowledge success when at least the required number of in-sync replicas has written the record.
+
+### Real failure example
+
+Scenario A: one broker crashes
+
+- Leader = Broker A
+- Followers = Broker B and Broker C
+- ISR = {A, B, C}
+- Broker C crashes
+- ISR becomes {A, B}
+- Producer uses `acks=all`
+- Kafka still accepts the write because the required minimum (`min.insync.replicas=2`) is still satisfied
+
+Scenario B: second broker crashes
+
+- Leader = Broker A
+- Follower = Broker B
+- ISR = {A, B}
+- Then Broker B crashes
+- ISR becomes {A}
+- `min.insync.replicas=2` is no longer satisfied
+- Kafka rejects new writes with a not-enough-replicas error to prevent data loss
+
+### One-line summary
+
+- `replication.factor` = how many copies exist
+- ISR = which copies are considered healthy and caught up
+- `acks=all` = how strongly the producer waits before it considers the write successful
+
+So the production-safe pattern is:
+
+- replication factor = 3
+- min.insync.replicas = 2
+- acks = all
+
+This gives you strong durability and safe failover, while still allowing one broker to fail without losing committed data.
+
+---
+
+
+
+
+## high level diagram
+```mermaid
+flowchart LR
+  producer[Producer application<br/>key selects partition] -->|bootstrap and metadata lookup| b1
+
+  subgraph cluster[Kafka KRaft cluster]
+    direction LR
+
+    subgraph broker1[Broker 1 and controller voter]
+      direction TB
+      o0l[orders P0<br/>LEADER, log]
+      o1f[orders P1<br/>FOLLOWER, ISR]
+      o2f[orders P2<br/>FOLLOWER, ISR]
+      t0f[telemetry P0<br/>FOLLOWER, ISR]
+      t1f[telemetry P1<br/>FOLLOWER, ISR]
+      t2l[telemetry P2<br/>LEADER, log]
+      b1[Broker 1]
+    end
+
+    subgraph broker2[Broker 2 and controller voter]
+      direction TB
+      o0f[orders P0<br/>FOLLOWER, ISR]
+      o1l[orders P1<br/>LEADER, log]
+      o2f2[orders P2<br/>FOLLOWER, ISR]
+      t0l[telemetry P0<br/>LEADER, log]
+      t1f2[telemetry P1<br/>FOLLOWER, ISR]
+      t2f[telemetry P2<br/>FOLLOWER, ISR]
+      b2[Broker 2]
+    end
+
+    subgraph broker3[Broker 3 and controller voter]
+      direction TB
+      o0f2[orders P0<br/>FOLLOWER, ISR]
+      o1f3[orders P1<br/>FOLLOWER, ISR]
+      o2l[orders P2<br/>LEADER, log]
+      t0f2[telemetry P0<br/>FOLLOWER, ISR]
+      t1l[telemetry P1<br/>LEADER, log]
+      t2f2[telemetry P2<br/>FOLLOWER, ISR]
+      b3[Broker 3]
+    end
+
+    offsets[(Internal topic<br/>__consumer_offsets)]
+    coordinator[Group coordinator<br/>on a broker]
+  end
+
+  producer -->|produce to current leader| o0l
+  producer -->|produce to current leader| o1l
+  producer -->|produce to current leader| o2l
+  producer -->|produce to current leader| t0l
+
+  o0l -.->|replicate| o0f
+  o0l -.->|replicate| o0f2
+  o1l -.->|replicate| o1f
+  o1l -.->|replicate| o1f3
+  o2l -.->|replicate| o2f
+  o2l -.->|replicate| o2f2
+  t0l -.->|replicate| t0f
+  t0l -.->|replicate| t0f2
+  t1l -.->|replicate| t1f
+  t1l -.->|replicate| t1f2
+  t2l -.->|replicate| t2f
+  t2l -.->|replicate| t2f2
+
+  subgraph groupA[Consumer group A: inventory-service]
+    direction TB
+    a1[Consumer A1]
+    a2[Consumer A2]
+    a3[Consumer A3]
+  end
+
+  subgraph groupB[Consumer group B: analytics-service]
+    direction TB
+    c1[Consumer B1]
+    c2[Consumer B2]
+  end
+
+  o0l -->|fetch P0| a1
+  o1l -->|fetch P1| a2
+  o2l -->|fetch P2| a3
+  o0l -->|fetch P0| c1
+  o1l -->|fetch P1| c2
+  o2l -->|fetch P2| c2
+
+  a1 -->|commit offsets| coordinator
+  c1 -->|join, heartbeat, commit| coordinator
+  coordinator --> offsets
+
+  controller[Active KRaft controller<br/>elected from the three voters]
+  b1 -.->|controller quorum metadata| controller
+  b2 -.->|controller quorum metadata| controller
+  b3 -.->|controller quorum metadata| controller
+```
+
+**How to read this example**
+- Each partition is one ordered log. Its leader handles normal producer writes and consumer fetches; follower replicas copy that log. ISR means replicas currently considered caught up enough for safe replication.
+- The shown placement is an example with replication factor 3: each partition has one replica on each broker, and leadership is spread across brokers. Real placement and leaders depend on Kafka metadata and can change after failures or reassignment.
+- Each consumer group gets its own assignment and its own offsets. A partition is assigned to at most one consumer within a group, but consumers in different groups independently read the same records. A group can have fewer consumers than partitions, as shown for analytics-service.
+- The producer bootstraps through any reachable broker, fetches cluster metadata, chooses a partition (keyed records normally hash the key), then sends directly to that partition's current leader. Followers replicate from the leader; they are not a separate downstream queue.
+- The group coordinator manages membership, heartbeats, and rebalances. Committed group offsets are stored in Kafka's replicated, compacted `__consumer_offsets` topic. Consumer processing and offset commits are separate, so delivery is not automatically exactly-once.
+- In this Compose setup every node has both `broker` and `controller` roles. The three controller voters form the KRaft metadata quorum; the active controller manages cluster metadata and is not in the normal record data path. The active controller is elected and may be on any voter.
+- With producer `acks=all`, Kafka acknowledges after the current ISR has replicated the record; `min.insync.replicas` sets the minimum ISR size required for such a write. Replication factor alone does not guarantee zero data loss.
+
+
