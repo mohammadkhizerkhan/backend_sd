@@ -336,8 +336,122 @@ docker exec -it redis-master redis-cli INFO replication
 ## 7. Phase 0 Readiness Checklist
 
 Before proceeding to Phase 1, ensure you can answer and verify the following:
-- [ ] What is the purpose of Sentinel Quorum, and why are an odd number of Sentinels (e.g., 3 or 5) required to prevent split-brain?
-- [ ] How does `PSYNC` replication work between master and replica?
-- [ ] What happens when a client sends a write command (`SET`) to a read-only replica?
-- [ ] Why is Memcached's multi-threaded model fundamentally different from Redis's event loop?
-- [ ] All 7 containers are healthy and running cleanly under `docker compose ps`.
+- [x] What is the purpose of Sentinel Quorum, and why are an odd number of Sentinels (e.g., 3 or 5) required to prevent split-brain?
+- [x] How does `PSYNC` replication work between master and replica?
+- [x] What happens when a client sends a write command (`SET`) to a read-only replica?
+- [x] Why is Memcached's multi-threaded model fundamentally different from Redis's event loop?
+- [x] All 9 containers are healthy and running cleanly under `docker compose ps`.
+
+---
+
+### Answers
+
+#### Q1. Sentinel Quorum & why an odd number of Sentinels
+
+Two thresholds are involved and they are often confused:
+
+| Concept | Value in our setup | What it controls |
+|---------|-------------------|------------------|
+| **Quorum** (`sentinel monitor ... 2`) | `2` | How many Sentinels must agree the master is unreachable to flip it from **SDOWN** (Subjectively Down — one Sentinel's opinion) to **ODOWN** (Objectively Down — agreed fact). |
+| **Majority** (implicit, `N/2 + 1`) | `2` of `3` | How many Sentinels must **vote for the same leader** before that leader is *authorized* to perform the failover. |
+
+**Failover flow:**
+1. A Sentinel misses PONGs for `down-after-milliseconds` (3s) → marks master `+sdown`.
+2. It asks peers via `SENTINEL is-master-down-by-addr`. Once ≥ quorum agree → `+odown`.
+3. Sentinels increment the **epoch** (a Raft-like term) and request votes. Each Sentinel votes **once per epoch** (first-come-first-served).
+4. The candidate that receives a **majority** becomes leader, picks the best replica (lowest `replica-priority` → largest replication offset → lowest run ID), sends it `REPLICAOF NO ONE`, and repoints the other replicas.
+
+**Why odd numbers?** Majority is what prevents split-brain, and odd counts maximize fault tolerance per node:
+
+| Sentinels | Majority needed | Failures tolerated |
+|-----------|-----------------|--------------------|
+| 2 | 2 | **0** — losing one Sentinel makes failover impossible |
+| 3 | 2 | 1 |
+| 4 | 3 | 1 (no gain over 3, one more machine) |
+| 5 | 3 | 2 |
+
+During a network partition, only **one** side can hold a majority. So only one side can elect a leader and promote a new master. With an even count (e.g., 4 split 2/2) **neither** side gets a majority, so availability is lost for nothing.
+
+> [!WARNING]
+> Sentinel majority prevents **two failovers**. It does **not** stop the *old* master from accepting writes while it's isolated with some clients — those writes are lost when it rejoins as a replica. Mitigate with `min-replicas-to-write 1` + `min-replicas-max-lag 10` on the master so it refuses writes when it can't see its replicas.
+
+Also: place Sentinels on **independent failure domains** (different hosts/AZs). 3 Sentinels on one VM give zero real fault tolerance.
+
+---
+
+#### Q2. How `PSYNC` replication works
+
+Every master maintains:
+- **Replication ID** — a random 40-char ID identifying a dataset history. A promoted replica gets a new ID (and remembers the old one as `master_replid2`, which lets the surviving replicas partially resync after failover).
+- **Replication offset** — a byte counter incremented for every byte of write stream sent.
+- **Replication backlog** — a fixed-size circular buffer (`repl-backlog-size`, default 1MB) holding the most recent write stream.
+
+When a replica connects it sends `PSYNC <replid> <offset>`:
+
+```text
+Replica                                 Master
+  │── PSYNC <replid> <offset> ─────────────►│
+  │                                         │ replid matches AND offset still in backlog?
+  │◄──────────── +CONTINUE ─────────────────│   YES → Partial resync: stream only missing bytes
+  │                                         │
+  │◄──────── +FULLRESYNC <replid> <off> ────│   NO  → Full resync:
+  │◄──────── RDB snapshot (BGSAVE / fork) ──│        1. fork() child, write RDB snapshot
+  │◄──────── buffered writes since fork ────│        2. buffer new writes in replica output buffer
+  │◄──────── live command stream ───────────│        3. send RDB, then buffered writes, then stream live
+```
+
+- **First connect** uses `PSYNC ? -1` → always a full resync.
+- **Brief disconnects** (network blip, replica restart) → partial resync if the gap still fits in the backlog. Size the backlog as `write_bytes_per_sec × max_expected_disconnect_secs`.
+- Replication is **asynchronous**: the master acks the client *before* replicas receive the write. A crash in that window loses acknowledged writes. `WAIT numreplicas timeout` lets a client block until N replicas confirm, but this is still not strong consistency.
+- Replicas send `REPLCONF ACK <offset>` every second. That's how the master computes `lag` in `INFO replication`.
+
+---
+
+#### Q3. Write command (`SET`) sent to a read-only replica
+
+The replica rejects it immediately:
+
+```text
+(error) READONLY You can't write against a read only replica.
+```
+
+- Controlled by `replica-read-only yes` (the default). The data is **not** written locally and **not** forwarded to the master. Redis has no write proxying.
+- The client is responsible for routing writes to the master. Sentinel-aware clients (e.g., go-redis `NewFailoverClient`) ask Sentinel via `SENTINEL get-master-addr-by-name mymaster` and reconnect after `+switch-master`.
+- After a failover, a client still pinned to the old (now demoted) master hits `READONLY`. Good clients treat it as a signal to rediscover the master.
+- If you set `replica-read-only no`, local writes succeed but **diverge** silently. They're never replicated and get wiped at the next full resync. Avoid it.
+
+*Verified in Lab 1.*
+
+---
+
+#### Q4. Memcached multi-threading vs the Redis event loop
+
+| Aspect | Memcached | Redis |
+|--------|-----------|-------|
+| **Execution model** | Multi-threaded: one listener thread accepts connections and hands them round-robin to N worker threads (`-t 4`), each running its own libevent loop. | Single-threaded event loop (epoll/kqueue) executes **all commands** serially. Redis 6+ `io-threads` parallelizes only socket read/write + protocol parsing, never command execution. |
+| **Concurrency control** | Fine-grained locks: striped item locks on hash buckets, per-slab-class locks, LRU locks. | None needed. Every command is atomic because nothing else runs at the same time. |
+| **Scaling** | Vertical: one process uses all cores. | Horizontal: one core per instance, so you scale by running more instances (Redis Cluster / sharding). |
+| **Data model** | Opaque byte blobs (`get`/`set`/`incr`/`cas`). Operations are trivially O(1). | Rich structures (lists, hashes, sorted sets, streams), Lua scripts, transactions, which all rely on serial execution for atomicity. |
+| **Failure mode** | Lock contention on hot keys; no single slow command blocks the whole server. | One slow command (`KEYS *`, `DEL` on a 1M-element set, heavy Lua) blocks **every** client. |
+| **Memory** | Slab allocator: fixed-size chunk classes. No external fragmentation, but internal waste and possible slab calcification. | `jemalloc` with per-object allocation; monitor `mem_fragmentation_ratio`. |
+| **Persistence / HA** | None. Pure cache, no replication. | RDB/AOF, replication, Sentinel, Cluster. |
+
+**The fundamental difference:** Memcached spends cores to get throughput and pays for it with locking, which it can afford because its operations are simple. Redis gives up multi-core execution so that every command, script, and transaction is atomic with no locking. That keeps complex data structures fast and race-free, at the cost of needing sharding to use more cores.
+
+---
+
+#### Q5. Container health
+
+There are **9** containers in the stack, not 7: master, 2 replicas, 3 sentinels, memcached, redisinsight, redis-exporter.
+
+```bash
+docker compose -f cache/docker-compose.yml ps
+docker exec redis-sentinel-1 redis-cli -p 26379 SENTINEL ckquorum mymaster
+# OK 3 usable Sentinels. Quorum and failover authorization can be reached
+```
+
+> [!NOTE]
+> **Sentinel + hostnames gotcha:** Since Redis 6.2, Sentinel rejects hostnames like `redis-master` in `sentinel monitor` (*"Can't resolve instance hostname"*) unless `sentinel resolve-hostnames yes` appears **before** the monitor line. `wait-for-redis.sh` generates the config with this flag (plus `announce-hostnames yes`).
+
+> [!TIP]
+> After running the Section 6 chaos test, the master role moves to a replica. Always find the current master with `SENTINEL get-master-addr-by-name mymaster` rather than assuming `redis-master` is the master.
